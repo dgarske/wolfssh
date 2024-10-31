@@ -19,6 +19,7 @@
  */
 
 
+#include "wolftpm/tpm2_wrap.h"
 #ifdef HAVE_CONFIG_H
     #include <config.h>
 #endif
@@ -53,6 +54,7 @@ static byte pubKeyLoaded = 0; /* was a public key loaded */
 static byte userPrivateKeyBuf[1191]; /* Size equal to hanselPrivateRsaSz. */
 static byte* userPrivateKey = userPrivateKeyBuf;
 static word32 userPublicKeyTypeSz = 0;
+static byte userPrivateKeyAlloc = 0;
 static word32 userPrivateKeySz = sizeof(userPrivateKeyBuf);
 static word32 userPrivateKeyTypeSz = 0;
 static byte isPrivate = 0;
@@ -68,7 +70,16 @@ static const byte publicKeyType[] = "x509v3-ecdsa-sha2-nistp256";
 #endif
 #endif
 
-
+#ifdef WOLFSSH_TPM
+    #if !defined(WOLFTPM_USER_SETTINGS)
+        /* use generated options.h */
+        #include <wolftpm/options.h>
+    #endif
+    #include <wolftpm/tpm2_wrap.h>
+    #include <hal/tpm_io.h>
+    WOLFTPM2_DEV tpmDev;
+    WOLFTPM2_KEY tpmKey;
+#endif /* WOLFSSH_TPM */
 
 
 #ifndef WOLFSSH_NO_RSA
@@ -677,6 +688,236 @@ int ClientUseCert(const char* certName, void* heap)
     return ret;
 }
 
+#ifdef WOLFSSH_TPM
+
+#define TPM2_DEMO_STORAGE_KEY_HANDLE    0x81000200  /* Persistent Storage Key Handle (RSA) */
+
+static const char gStorageKeyAuth[] = "ThisIsMyStorageKeyAuth";
+
+static int getPrimaryStoragekey(WOLFTPM2_DEV* pDev,
+                         WOLFTPM2_KEY* pStorageKey,
+                         TPM_ALG_ID alg)
+{
+    int rc;
+
+    WLOG(WS_LOG_DEBUG, "Entering getPrimaryStoragekey()");
+
+    /* See if SRK already exists */
+    rc = wolfTPM2_ReadPublicKey(pDev, pStorageKey, TPM2_DEMO_STORAGE_KEY_HANDLE);
+    if (rc != 0) {
+        /* Create primary storage key */
+        rc = wolfTPM2_CreateSRK(pDev, pStorageKey, alg,
+            (byte*)gStorageKeyAuth, sizeof(gStorageKeyAuth)-1);
+    #ifndef WOLFTPM_WINAPI
+        if (rc == TPM_RC_SUCCESS) {
+            /* Move storage key into persistent NV */
+            rc = wolfTPM2_NVStoreKey(pDev, TPM_RH_OWNER, pStorageKey,
+                TPM2_DEMO_STORAGE_KEY_HANDLE);
+        }
+    #endif
+    }
+    else {
+        /* specify auth password for storage key */
+        pStorageKey->handle.auth.size = sizeof(gStorageKeyAuth)-1;
+        XMEMCPY(pStorageKey->handle.auth.buffer, gStorageKeyAuth,
+                pStorageKey->handle.auth.size);
+    }
+    if (rc != 0) {
+        printf("Loading SRK: Storage failed 0x%x: %s\n", rc,
+            TPM2_GetRCString(rc));
+        return rc;
+    }
+    printf("Loading SRK: Storage 0x%x (%d bytes)\n",
+        (word32)pStorageKey->handle.hndl, pStorageKey->pub.size);
+    WLOG(WS_LOG_DEBUG, "Leaving getPrimaryStoragekey(), rc = %d", rc);
+    return rc;
+}
+
+
+static int readKeyBlob(const char* filename, WOLFTPM2_KEYBLOB* key)
+{
+    int rc = 0;
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    XFILE  fp = NULL;
+    size_t fileSz = 0;
+    size_t bytes_read = 0;
+    byte pubAreaBuffer[sizeof(TPM2B_PUBLIC)];
+    int pubAreaSize;
+
+    WLOG(WS_LOG_DEBUG, "Entering readKeyBlob()");
+
+    XMEMSET(key, 0, sizeof(WOLFTPM2_KEYBLOB));
+
+    fp = XFOPEN(filename, "rb");
+    if (fp != XBADFILE) {
+        XFSEEK(fp, 0, XSEEK_END);
+        fileSz = XFTELL(fp);
+        XREWIND(fp);
+        if (fileSz > sizeof(key->priv) + sizeof(key->pub)) {
+            printf("File size check failed\n");
+            rc = BUFFER_E; goto exit;
+        }
+        printf("Reading %d bytes from %s\n", (int)fileSz, filename);
+
+        bytes_read = XFREAD(&key->pub.size, 1, sizeof(key->pub.size), fp);
+        if (bytes_read != sizeof(key->pub.size)) {
+            printf("Read %zu, expected size marker of %zu bytes\n",
+                bytes_read, sizeof(key->pub.size));
+            goto exit;
+        }
+        fileSz -= bytes_read;
+
+        bytes_read = XFREAD(pubAreaBuffer, 1, sizeof(UINT16) + key->pub.size, fp);
+        if (bytes_read != sizeof(UINT16) + key->pub.size) {
+            printf("Read %zu, expected public blob %zu bytes\n",
+                bytes_read, sizeof(UINT16) + key->pub.size);
+            goto exit;
+        }
+        fileSz -= bytes_read; /* Reminder bytes for private key part */
+
+        /* Decode the byte stream into a publicArea structure ready for use */
+        rc = TPM2_ParsePublic(&key->pub, pubAreaBuffer,
+            (word32)sizeof(pubAreaBuffer), &pubAreaSize);
+        if (rc != TPM_RC_SUCCESS) return rc;
+
+        if (fileSz > 0) {
+            printf("Reading the private part of the key\n");
+            bytes_read = XFREAD(&key->priv, 1, fileSz, fp);
+            if (bytes_read != fileSz) {
+                printf("Read %zu, expected private blob %zu bytes\n",
+                    bytes_read, fileSz);
+                goto exit;
+            }
+            rc = 0; /* success */
+        }
+
+        /* sanity check the sizes */
+        if (pubAreaSize != (key->pub.size + (int)sizeof(key->pub.size)) ||
+             key->priv.size > sizeof(key->priv.buffer)) {
+            printf("Struct size check failed (pub %d, priv %d)\n",
+                   key->pub.size, key->priv.size);
+            rc = BUFFER_E;
+        }
+    }
+    else {
+        rc = BUFFER_E;
+        printf("File %s not found!\n", filename);
+        printf("Keys can be generated by running:\n"
+               "  ./examples/keygen/keygen rsa_test_blob.raw -rsa -t\n"
+               "  ./examples/keygen/keygen ecc_test_blob.raw -ecc -t\n");
+    }
+
+exit:
+    if (fp)
+      XFCLOSE(fp);
+#else
+    (void)filename;
+    (void)key;
+#endif /* !NO_FILESYSTEM && !NO_WRITE_TEMP_FILES */
+    WLOG(WS_LOG_DEBUG, "Leaving readKeyBlob(), rc = %d", rc);
+    return rc;
+}
+
+static int wolfSSH_TPM_InitKey(WOLFTPM2_DEV* dev, const char* name,
+                               WOLFTPM2_KEY* pTpmKey)
+{
+    int rc;
+    WOLFTPM2_KEY storage;
+    WOLFTPM2_KEYBLOB tpmKeyBlob;
+    byte der[512];
+    word32 derSz = (word32)sizeof(der);
+    void* heap = NULL;
+
+    WLOG(WS_LOG_DEBUG, "Entering wolfSSH_TPM_InitKey()");
+
+    if (wolfTPM2_Init(dev, TPM2_IoCb, NULL) != TPM_RC_SUCCESS) {
+#ifdef DEBUG_WOLFSSH
+        printf("TPM 2.0 Device initialization failed\n");
+#endif
+        return WOLFSSH_TPM_FAILED_INIT;
+    }
+
+    /* TPM 2.0 keys live under a Primary Key, acquire such key */
+    if (getPrimaryStoragekey(dev, &storage, TPM_ALG_RSA)) {
+#ifdef DEBUG_WOLFSSH
+        printf("Acquiring a Primary TPM 2.0 Key failed\n");
+#endif
+        return WOLFSSH_TPM_FAILED_LOAD_PRIMARY;
+    }
+
+    /* Load the TPM 2.0 key blob from disk */
+    if (readKeyBlob(name, &tpmKeyBlob) != TPM_RC_SUCCESS) {
+#ifdef DEBUG_WOLFSSH
+        printf("Reading key blob from disk failed\n");
+#endif
+        return WOLFSSH_TPM_FAILED_READ_KEYBLOB;
+    }
+
+    /* workaround until password can be supplied */
+    /* consider a refactor to take a 32-bit handle and key auth password */
+    static const char gKeyAuth[] =        "ThisIsMyKeyAuth";
+    /* set session for authorization key */
+    tpmKeyBlob.handle.auth.size = (int)sizeof(gKeyAuth)-1;
+    XMEMCPY(tpmKeyBlob.handle.auth.buffer, gKeyAuth, tpmKeyBlob.handle.auth.size);
+
+    /* Load the public key into the TPM device */
+    if (wolfTPM2_LoadKey(dev, &tpmKeyBlob, &storage.handle) != TPM_RC_SUCCESS) {
+#ifdef DEBUG_WOLFSSH
+        printf("wolfTPM2_LoadKey failed\n");
+#endif
+        return WOLFSSH_TPM_FAILED_LOAD_KEY;
+    }
+#ifdef DEBUG_WOLFSSH
+    printf("Loaded key to 0x%x\n", (word32)tpmKeyBlob.handle.hndl);
+#endif
+
+    /* Read the public key and extract the public key as a DER/ASN.1 */
+    if (wolfTPM2_ExportPublicKeyBuffer(dev, (WOLFTPM2_KEY*)&tpmKeyBlob,
+                           ENCODING_TYPE_ASN1, der, &derSz) != TPM_RC_SUCCESS) {
+#ifdef DEBUG_WOLFSSH
+        printf("Exporting TPM key failed\n");
+#endif
+        return WOLFSSH_TPM_FAILED_EXPORT_KEY;
+    }
+
+    /* Read public key from the buffer */
+    byte* p = userPublicKey;
+    userPublicKeySz = sizeof(userPublicKeyBuf);
+
+    rc = wolfSSH_ReadPublicKey_buffer(der, derSz, WOLFSSH_FORMAT_ASN1, &p,
+        &userPublicKeySz, &userPublicKeyType, &userPublicKeyTypeSz, heap);
+    if (rc != TPM_RC_SUCCESS) {
+#ifdef DEBUG_WOLFSSH
+        printf("Reading public key failed returned: %d\n", rc);
+#endif
+        return WOLFSSH_TPM_FAILED_READ_PUBLIC_KEY;
+    }
+
+    XMEMCPY(&pTpmKey->handle, &tpmKeyBlob.handle, sizeof(pTpmKey->handle));
+    XMEMCPY(&pTpmKey->pub, &tpmKeyBlob.pub, sizeof(pTpmKey->pub));
+
+    /* Unload SRK storage handle */
+    wolfTPM2_UnloadHandle(dev, &storage.handle);
+    /* Key handle is unloaded on TPM cleanup */
+
+    WLOG(WS_LOG_DEBUG, "Leaving wolfSSH_TPM_InitKey()");
+    return WOLFSSH_TPM_SUCCESS;
+}
+
+static void wolfSSH_TPM_Cleanup(WOLFTPM2_DEV* dev, WOLFTPM2_KEY* key)
+{
+    WLOG(WS_LOG_DEBUG, "Entering wolfSSH_TPM_Cleanup()");
+    if (key != NULL) {
+        wolfTPM2_UnloadHandle(dev, &key->handle);
+    }
+
+    if (dev != NULL) {
+        wolfTPM2_Cleanup(dev);
+    }
+    WLOG(WS_LOG_DEBUG, "Leaving wolfSSH_TPM_Cleanup()");
+}
+#endif /* WOLFSSH_TPM */
+
 
 /* Reads the private key to use from file name privKeyName.
  * returns 0 on success */
@@ -702,8 +943,22 @@ int ClientSetPrivateKey(const char* privKeyName, int userEcc, void* heap)
         isPrivate = 1;
     }
     else {
-    #ifndef NO_FILESYSTEM
+    #if defined(WOLFSSH_TPM)
+        /* Protecting the SSH Private Key using a TPM 2.0 device
+         *
+         * TPM-backed keys do not require a user buffer, because
+         * the private key is loaded securely inside the TPM and
+         * used only from within the TPM for higher security.
+         *
+         * Successfully loaded TPM key has a TPM Handle that is
+         * later passed to wolfSSH for use
+         */
+        WMEMSET(&tpmDev, 0, sizeof(tpmDev));
+        WMEMSET(&tpmKey, 0, sizeof(tpmKey));
+        ret = wolfSSH_TPM_InitKey(&tpmDev, privKeyName, &tpmKey);
+    #elif !defined(NO_FILESYSTEM)
         userPrivateKey = NULL; /* create new buffer based on parsed input */
+        userPrivateKeyAlloc = 1;
         ret = wolfSSH_ReadKey_file(privKeyName,
                 (byte**)&userPrivateKey, &userPrivateKeySz,
                 (const byte**)&userPrivateKeyType, &userPrivateKeyTypeSz,
@@ -711,12 +966,22 @@ int ClientSetPrivateKey(const char* privKeyName, int userEcc, void* heap)
     #else
         printf("file system not compiled in!\n");
         ret = NOT_COMPILED_IN;
-    #endif
+    #endif /* WOLFSSH_TPM / NO_FILESYSTEM */
     }
 
     return ret;
 }
 
+#ifdef WOLFSSH_TPM
+int CLientSetTpm(WOLFSSH* ssh)
+{
+    if (ssh != NULL) {
+        wolfSSH_SetTpmDev(ssh, &tpmDev);
+        wolfSSH_SetTpmKey(ssh, &tpmKey);
+    }
+    return 0;
+}
+#endif
 
 /* Set public key to use
  * returns 0 on success */
@@ -747,16 +1012,27 @@ int ClientUsePubKey(const char* pubKeyName, int userEcc, void* heap)
         isPrivate = 1;
     }
     else {
-    #ifndef NO_FILESYSTEM
-        userPublicKey = NULL; /* create new buffer based on parsed input */
+        byte* p = userPublicKey;
+        userPublicKeySz = sizeof(userPublicKey);
+
+    #if defined(WOLFSSH_TPM)
+        /* When TPM is used, the PublicKey is available as
+         * a binary buffer and converted to wolfSSH type
+         */
+
+        ret = wolfSSH_ReadKey_buffer((const byte*)tpmKey.pub.publicArea.unique.rsa.buffer,
+                (word32)tpmKey.pub.publicArea.unique.rsa.size, WOLFSSH_FORMAT_SSH,
+                &p, &userPublicKeySz, &userPublicKeyType, &userPublicKeyTypeSz, NULL);
+    #elif !defined(NO_FILESYSTEM)
+
         ret = wolfSSH_ReadKey_file(pubKeyName,
-                &userPublicKey, &userPublicKeySz,
+                &p, &userPublicKeySz,
                 (const byte**)&userPublicKeyType, &userPublicKeyTypeSz,
-                &isPrivate, heap);
+                &isPrivate, NULL);
     #else
         printf("file system not compiled in!\n");
-        ret = -1;
-    #endif
+        ret = NOT_COMPILED_IN;
+    #endif /* WOLFSSH_TPM / NO_FILESYSTEM */
         if (ret == 0) {
             pubKeyLoaded = 1;
         }
@@ -793,15 +1069,17 @@ int ClientLoadCA(WOLFSSH_CTX* ctx, const char* caCert)
     return ret;
 }
 
-
 void ClientFreeBuffers(const char* pubKeyName, const char* privKeyName,
         void* heap)
 {
+#ifdef WOLFSSH_TPM
+    wolfSSH_TPM_Cleanup(&tpmDev, &tpmKey);
+#endif
     if (pubKeyName != NULL && userPublicKey != NULL) {
         WFREE(userPublicKey, heap, DYNTYPE_PRIVKEY);
     }
 
-    if (privKeyName != NULL && userPrivateKey != NULL) {
+    if (privKeyName != NULL && userPrivateKey != NULL && userPrivateKeyAlloc) {
         WFREE(userPrivateKey, heap, DYNTYPE_PRIVKEY);
     }
 }
